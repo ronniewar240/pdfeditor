@@ -1,312 +1,385 @@
-import os
-import uuid
-from pathlib import Path
-from flask import Flask, render_template, request, send_file, jsonify, url_for
-from werkzeug.utils import secure_filename
-import fitz  # PyMuPDF
-from pypdf import PdfWriter, PdfReader
 import base64
+import io
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import fitz  # PyMuPDF
+import streamlit as st
+from PIL import Image
+from pypdf import PdfReader, PdfWriter
+from streamlit_drawable_canvas import st_canvas
+
+st.set_page_config(page_title="PDF Studio - Streamlit", page_icon="📄", layout="wide")
+
+CUSTOM_CSS = """
+<style>
+.stApp { background: #0f1117; color: #f3f4f6; }
+[data-testid="stSidebar"] { background: #141824; }
+.block-container { padding-top: 1.2rem; }
+.tool-card {
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.04);
+    border-radius: 18px;
+    padding: 16px;
+    margin-bottom: 12px;
+}
+.small-muted { color: #9ca3af; font-size: 0.9rem; }
+.adobe-title { font-size: 1.7rem; font-weight: 800; letter-spacing: -0.02em; }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
-BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 120 * 1024 * 1024
-ALLOWED = {"pdf"}
-
-
-def is_pdf(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED
+def init_state():
+    defaults = {
+        "pdf_bytes": None,
+        "pdf_name": "uploaded.pdf",
+        "page_overlays": {},
+        "signature_png": None,
+        "canvas_seed": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
-def save_upload(file):
-    if not file or not is_pdf(file.filename):
-        raise ValueError("Please upload a PDF file.")
-    safe_name = secure_filename(file.filename)
-    unique_name = f"{uuid.uuid4().hex}_{safe_name}"
-    path = UPLOAD_DIR / unique_name
-    file.save(path)
-    return path
+def open_pdf(pdf_bytes: bytes) -> fitz.Document:
+    return fitz.open(stream=pdf_bytes, filetype="pdf")
 
 
-def output_path(prefix="edited"):
-    return OUTPUT_DIR / f"{prefix}_{uuid.uuid4().hex}.pdf"
+def render_page(pdf_bytes: bytes, page_index: int, zoom: float = 1.5) -> Tuple[Image.Image, fitz.Rect]:
+    doc = open_pdf(pdf_bytes)
+    page = doc[page_index]
+    rect = page.rect
+    matrix = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    doc.close()
+    return img, rect
 
 
-def parse_pages(text: str, total: int):
-    text = (text or "all").strip().lower()
-    if text in ["", "all", "*"]:
-        return list(range(total))
-    pages = []
-    for part in text.replace(" ", "").split(","):
+def image_to_base64_png(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def normalize_canvas_objects(json_data) -> List[Dict]:
+    if not json_data or "objects" not in json_data:
+        return []
+    objects = []
+    for obj in json_data["objects"]:
+        if obj.get("type") in {"text", "i-text", "textbox", "image"}:
+            objects.append(obj)
+    return objects
+
+
+def make_text_object(text: str, left=120, top=120, font_size=24) -> Dict:
+    return {
+        "type": "textbox",
+        "version": "4.4.0",
+        "originX": "left",
+        "originY": "top",
+        "left": left,
+        "top": top,
+        "width": max(160, len(text) * font_size * 0.6),
+        "height": font_size * 1.5,
+        "fill": "#111111",
+        "stroke": None,
+        "strokeWidth": 1,
+        "fontFamily": "Arial",
+        "fontSize": font_size,
+        "fontWeight": "normal",
+        "fontStyle": "normal",
+        "lineHeight": 1.16,
+        "text": text,
+        "textAlign": "left",
+        "scaleX": 1,
+        "scaleY": 1,
+        "angle": 0,
+    }
+
+
+def make_signature_object(signature_png: bytes, left=140, top=180, width=220) -> Dict:
+    img = Image.open(io.BytesIO(signature_png)).convert("RGBA")
+    w, h = img.size
+    data_url = "data:image/png;base64," + base64.b64encode(signature_png).decode("utf-8")
+    return {
+        "type": "image",
+        "version": "4.4.0",
+        "originX": "left",
+        "originY": "top",
+        "left": left,
+        "top": top,
+        "width": w,
+        "height": h,
+        "scaleX": width / w,
+        "scaleY": width / w,
+        "angle": 0,
+        "src": data_url,
+        "crossOrigin": None,
+    }
+
+
+def transparent_signature_from_canvas(canvas_result) -> bytes | None:
+    if canvas_result.image_data is None:
+        return None
+    img = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
+    bbox = img.getbbox()
+    if not bbox:
+        return None
+    img = img.crop(bbox)
+    datas = img.getdata()
+    new_data = []
+    for r, g, b, a in datas:
+        # remove white/near-white background, keep dark ink
+        if r > 245 and g > 245 and b > 245:
+            new_data.append((255, 255, 255, 0))
+        else:
+            new_data.append((r, g, b, a))
+    img.putdata(new_data)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def decode_data_url(data_url: str) -> bytes:
+    if "," in data_url:
+        data_url = data_url.split(",", 1)[1]
+    return base64.b64decode(data_url)
+
+
+def apply_overlays(pdf_bytes: bytes, overlays_by_page: Dict[int, List[Dict]], zoom: float) -> bytes:
+    doc = open_pdf(pdf_bytes)
+    for page_index, objects in overlays_by_page.items():
+        if not objects or page_index >= len(doc):
+            continue
+        page = doc[page_index]
+        for obj in objects:
+            left = float(obj.get("left", 0)) / zoom
+            top = float(obj.get("top", 0)) / zoom
+            width = float(obj.get("width", 0)) * float(obj.get("scaleX", 1)) / zoom
+            height = float(obj.get("height", 0)) * float(obj.get("scaleY", 1)) / zoom
+            angle = float(obj.get("angle", 0))
+            rect = fitz.Rect(left, top, left + width, top + height)
+
+            if obj.get("type") in {"textbox", "text", "i-text"}:
+                text = obj.get("text", "")
+                font_size = float(obj.get("fontSize", 20)) * float(obj.get("scaleY", 1)) / zoom
+                color = obj.get("fill", "#111111") or "#111111"
+                rgb = tuple(int(color.lstrip("#")[i:i + 2], 16) / 255 for i in (0, 2, 4)) if color.startswith("#") else (0, 0, 0)
+                page.insert_textbox(rect, text, fontsize=max(font_size, 6), fontname="helv", color=rgb, rotate=0)
+
+            elif obj.get("type") == "image" and obj.get("src"):
+                img_bytes = decode_data_url(obj["src"])
+                page.insert_image(rect, stream=img_bytes, rotate=int(angle) if angle in {0, 90, 180, 270} else 0, overlay=True)
+    out = io.BytesIO()
+    doc.save(out, garbage=4, deflate=True, clean=True)
+    doc.close()
+    return out.getvalue()
+
+
+def merge_pdfs(files) -> bytes:
+    writer = PdfWriter()
+    for f in files:
+        reader = PdfReader(f)
+        for page in reader.pages:
+            writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def split_pdf(pdf_file, ranges: str) -> bytes:
+    reader = PdfReader(pdf_file)
+    writer = PdfWriter()
+    total = len(reader.pages)
+    for part in ranges.split(","):
+        part = part.strip()
         if not part:
             continue
         if "-" in part:
-            start, end = part.split("-", 1)
-            start, end = int(start), int(end)
-            if start > end:
-                start, end = end, start
-            pages.extend(range(start - 1, end))
+            start, end = [int(x.strip()) for x in part.split("-", 1)]
         else:
-            pages.append(int(part) - 1)
-    pages = [p for p in dict.fromkeys(pages) if 0 <= p < total]
-    if not pages:
-        raise ValueError("No valid pages selected.")
-    return pages
+            start = end = int(part)
+        start = max(1, start)
+        end = min(total, end)
+        for p in range(start - 1, end):
+            writer.add_page(reader.pages[p])
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+def rotate_pdf(pdf_file, degrees: int) -> bytes:
+    reader = PdfReader(pdf_file)
+    writer = PdfWriter()
+    for page in reader.pages:
+        page.rotate(degrees)
+        writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
-@app.route("/api/info", methods=["POST"])
-def info():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        doc = fitz.open(pdf)
-        data = {
-            "pages": doc.page_count,
-            "metadata": doc.metadata,
-            "filename": pdf.name,
-            "original_name": request.files.get("pdf").filename,
-        }
-        doc.close()
-        return jsonify(data)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+def compress_pdf(pdf_bytes: bytes) -> bytes:
+    doc = open_pdf(pdf_bytes)
+    out = io.BytesIO()
+    doc.save(out, garbage=4, deflate=True, clean=True)
+    doc.close()
+    return out.getvalue()
 
 
-@app.route("/api/merge", methods=["POST"])
-def merge():
-    try:
-        files = request.files.getlist("pdfs")
-        if len(files) < 2:
-            raise ValueError("Upload at least 2 PDFs to merge.")
-        writer = PdfWriter()
-        for f in files:
-            path = save_upload(f)
-            reader = PdfReader(str(path))
-            for page in reader.pages:
-                writer.add_page(page)
-        out = output_path("merged")
-        with open(out, "wb") as fp:
-            writer.write(fp)
-        return send_file(out, as_attachment=True, download_name="merged.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+init_state()
 
+with st.sidebar:
+    st.markdown('<div class="adobe-title">PDF Studio</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-muted">Streamlit deploy version</div>', unsafe_allow_html=True)
+    st.divider()
 
-@app.route("/api/split", methods=["POST"])
-def split():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        pages_raw = request.form.get("pages", "").strip()
-        doc = fitz.open(pdf)
-        selected = parse_pages(pages_raw, doc.page_count)
-        new_doc = fitz.open()
-        for p in selected:
-            new_doc.insert_pdf(doc, from_page=p, to_page=p)
-        out = output_path("split")
-        new_doc.save(out)
-        new_doc.close(); doc.close()
-        return send_file(out, as_attachment=True, download_name="selected_pages.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+    uploaded = st.file_uploader("Upload PDF", type=["pdf"])
+    if uploaded:
+        st.session_state.pdf_bytes = uploaded.read()
+        st.session_state.pdf_name = uploaded.name
+        st.session_state.page_overlays = {}
+        st.session_state.canvas_seed += 1
 
+    tool = st.radio(
+        "Tools",
+        ["Edit PDF", "Merge PDFs", "Split PDF", "Rotate PDF", "Compress PDF"],
+        label_visibility="collapsed",
+    )
 
-@app.route("/api/delete-pages", methods=["POST"])
-def delete_pages():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        pages_raw = request.form.get("pages", "").strip()
-        doc = fitz.open(pdf)
-        selected = set(parse_pages(pages_raw, doc.page_count))
-        keep = [i for i in range(doc.page_count) if i not in selected]
-        if not keep:
-            raise ValueError("You cannot delete every page.")
-        new_doc = fitz.open()
-        for p in keep:
-            new_doc.insert_pdf(doc, from_page=p, to_page=p)
-        out = output_path("deleted_pages")
-        new_doc.save(out)
-        new_doc.close(); doc.close()
-        return send_file(out, as_attachment=True, download_name="pages_deleted.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+st.title("📄 Adobe-style PDF Editor")
+st.caption("Upload, add text, sign, move, resize, delete, and export edited PDFs.")
 
+if tool == "Merge PDFs":
+    st.subheader("Merge PDFs")
+    merge_files = st.file_uploader("Choose PDFs to merge", type=["pdf"], accept_multiple_files=True)
+    if st.button("Merge PDFs", disabled=not merge_files):
+        merged = merge_pdfs(merge_files)
+        st.download_button("Download merged PDF", merged, "merged.pdf", "application/pdf")
 
-@app.route("/api/reorder", methods=["POST"])
-def reorder():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        order_raw = request.form.get("order", "").strip()
-        if not order_raw:
-            raise ValueError("Enter page order like 3,1,2,4-6.")
-        doc = fitz.open(pdf)
-        order = parse_pages(order_raw, doc.page_count)
-        new_doc = fitz.open()
-        for p in order:
-            new_doc.insert_pdf(doc, from_page=p, to_page=p)
-        out = output_path("reordered")
-        new_doc.save(out)
-        new_doc.close(); doc.close()
-        return send_file(out, as_attachment=True, download_name="reordered.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+elif tool == "Split PDF":
+    st.subheader("Split PDF")
+    split_file = st.file_uploader("Choose PDF to split", type=["pdf"], key="split")
+    ranges = st.text_input("Pages to keep", value="1-2", help="Examples: 1-3, 5, 8-10")
+    if st.button("Create split PDF", disabled=not split_file):
+        result = split_pdf(split_file, ranges)
+        st.download_button("Download split PDF", result, "split.pdf", "application/pdf")
 
+elif tool == "Rotate PDF":
+    st.subheader("Rotate PDF")
+    rotate_file = st.file_uploader("Choose PDF to rotate", type=["pdf"], key="rotate")
+    degrees = st.selectbox("Rotation", [90, 180, 270])
+    if st.button("Rotate PDF", disabled=not rotate_file):
+        result = rotate_pdf(rotate_file, degrees)
+        st.download_button("Download rotated PDF", result, "rotated.pdf", "application/pdf")
 
-@app.route("/api/rotate", methods=["POST"])
-def rotate():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        degrees = int(request.form.get("degrees", "90"))
-        if degrees not in [90, 180, 270]:
-            raise ValueError("Rotation must be 90, 180, or 270 degrees.")
-        doc = fitz.open(pdf)
-        pages = parse_pages(request.form.get("pages", "all"), doc.page_count)
-        for idx in pages:
-            page = doc[idx]
-            page.set_rotation((page.rotation + degrees) % 360)
-        out = output_path("rotated")
-        doc.save(out)
-        doc.close()
-        return send_file(out, as_attachment=True, download_name="rotated.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+elif tool == "Compress PDF":
+    st.subheader("Compress PDF")
+    comp_file = st.file_uploader("Choose PDF to compress", type=["pdf"], key="compress")
+    if st.button("Compress PDF", disabled=not comp_file):
+        data = comp_file.read()
+        result = compress_pdf(data)
+        st.success(f"Reduced/cleaned from {len(data)/1024:.1f} KB to {len(result)/1024:.1f} KB")
+        st.download_button("Download compressed PDF", result, "compressed.pdf", "application/pdf")
 
+else:
+    if not st.session_state.pdf_bytes:
+        st.info("Upload a PDF from the left sidebar to start editing.")
+        st.stop()
 
-@app.route("/api/watermark", methods=["POST"])
-def watermark():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        text = request.form.get("text", "CONFIDENTIAL").strip() or "CONFIDENTIAL"
-        size = int(request.form.get("size", "54"))
-        opacity = float(request.form.get("opacity", "0.16"))
-        doc = fitz.open(pdf)
-        for page in doc:
-            rect = page.rect
-            page.insert_textbox(rect, text, fontsize=size, color=(0.55, 0.55, 0.55), rotate=45, align=1, overlay=True, fill_opacity=opacity)
-        out = output_path("watermarked")
-        doc.save(out, garbage=4, deflate=True)
-        doc.close()
-        return send_file(out, as_attachment=True, download_name="watermarked.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+    doc = open_pdf(st.session_state.pdf_bytes)
+    page_count = len(doc)
+    doc.close()
 
+    left, right = st.columns([0.72, 0.28], gap="large")
+    with right:
+        st.markdown('<div class="tool-card">', unsafe_allow_html=True)
+        page_number = st.number_input("Page", min_value=1, max_value=page_count, value=1, step=1)
+        zoom = st.slider("Preview zoom", 1.0, 2.5, 1.5, 0.1)
+        page_index = int(page_number) - 1
+        st.markdown("</div>", unsafe_allow_html=True)
 
-@app.route("/api/add-text", methods=["POST"])
-def add_text():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        text = request.form.get("text", "").strip()
-        page_num = int(request.form.get("page", "1")) - 1
-        x = float(request.form.get("x", "72"))
-        y = float(request.form.get("y", "72"))
-        size = int(request.form.get("size", "14"))
-        if not text:
-            raise ValueError("Text cannot be empty.")
-        doc = fitz.open(pdf)
-        if not 0 <= page_num < doc.page_count:
-            raise ValueError("Invalid page number.")
-        doc[page_num].insert_text((x, y), text, fontsize=size, color=(0, 0, 0))
-        out = output_path("text_added")
-        doc.save(out, garbage=4, deflate=True)
-        doc.close()
-        return send_file(out, as_attachment=True, download_name="text_added.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        st.markdown('<div class="tool-card">', unsafe_allow_html=True)
+        st.subheader("Add text")
+        text_value = st.text_input("Text", value="Your text")
+        font_size = st.slider("Font size", 10, 72, 24)
+        if st.button("Add text box"):
+            objs = st.session_state.page_overlays.get(page_index, [])
+            objs.append(make_text_object(text_value, font_size=font_size))
+            st.session_state.page_overlays[page_index] = objs
+            st.session_state.canvas_seed += 1
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
+        st.markdown('<div class="tool-card">', unsafe_allow_html=True)
+        st.subheader("Signature")
+        sig_canvas = st_canvas(
+            fill_color="rgba(255,255,255,0)",
+            stroke_width=3,
+            stroke_color="#111111",
+            background_color="#ffffff",
+            height=160,
+            width=320,
+            drawing_mode="freedraw",
+            key="signature_canvas",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Save signature"):
+                sig = transparent_signature_from_canvas(sig_canvas)
+                if sig:
+                    st.session_state.signature_png = sig
+                    st.success("Signature saved")
+        with c2:
+            if st.button("Add signature", disabled=not st.session_state.signature_png):
+                objs = st.session_state.page_overlays.get(page_index, [])
+                objs.append(make_signature_object(st.session_state.signature_png))
+                st.session_state.page_overlays[page_index] = objs
+                st.session_state.canvas_seed += 1
+                st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-@app.route("/api/sign", methods=["POST"])
-def sign_pdf():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        signature_data = request.form.get("signature", "").strip()
-        page_num = int(request.form.get("page", "1")) - 1
-        x = float(request.form.get("x", "72"))
-        y = float(request.form.get("y", "120"))
-        width = float(request.form.get("width", "180"))
-        if not signature_data.startswith("data:image/png;base64,"):
-            raise ValueError("Draw or upload a signature first.")
-        img_bytes = base64.b64decode(signature_data.split(",", 1)[1])
-        doc = fitz.open(pdf)
-        if not 0 <= page_num < doc.page_count:
-            raise ValueError("Invalid page number.")
-        page = doc[page_num]
-        height = width * 0.38
-        rect = fitz.Rect(x, y, x + width, y + height)
-        page.insert_image(rect, stream=img_bytes, overlay=True, keep_proportion=True)
-        out = output_path("signed")
-        doc.save(out, garbage=4, deflate=True)
-        doc.close()
-        return send_file(out, as_attachment=True, download_name="signed.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        st.markdown('<div class="tool-card">', unsafe_allow_html=True)
+        st.subheader("Delete")
+        d1, d2 = st.columns(2)
+        with d1:
+            if st.button("Delete last item"):
+                objs = st.session_state.page_overlays.get(page_index, [])
+                if objs:
+                    objs.pop()
+                    st.session_state.page_overlays[page_index] = objs
+                    st.session_state.canvas_seed += 1
+                    st.rerun()
+        with d2:
+            if st.button("Clear page"):
+                st.session_state.page_overlays[page_index] = []
+                st.session_state.canvas_seed += 1
+                st.rerun()
+        st.caption("To move or resize: select an overlay on the page, then drag it or its corner handles.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
+    with left:
+        page_img, page_rect = render_page(st.session_state.pdf_bytes, page_index, zoom=zoom)
+        initial_json = {"version": "4.4.0", "objects": st.session_state.page_overlays.get(page_index, [])}
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 255, 255, 0)",
+            stroke_width=1,
+            background_image=page_img,
+            update_streamlit=True,
+            height=page_img.height,
+            width=page_img.width,
+            drawing_mode="transform",
+            initial_drawing=initial_json,
+            key=f"main_canvas_{page_index}_{st.session_state.canvas_seed}",
+        )
 
-def hex_to_rgb(hex_color: str):
-    hex_color = (hex_color or "#000000").strip().lstrip("#")
-    if len(hex_color) != 6:
-        return (0, 0, 0)
-    return tuple(int(hex_color[i:i+2], 16) / 255 for i in (0, 2, 4))
+        current_objects = normalize_canvas_objects(canvas_result.json_data)
+        st.session_state.page_overlays[page_index] = current_objects
 
-
-@app.route("/api/apply-edits", methods=["POST"])
-def apply_edits():
-    try:
-        import json
-        pdf = save_upload(request.files.get("pdf"))
-        annotations = json.loads(request.form.get("annotations", "[]"))
-        doc = fitz.open(pdf)
-        for item in annotations:
-            page_num = int(item.get("page", 1)) - 1
-            if not 0 <= page_num < doc.page_count:
-                continue
-            page = doc[page_num]
-            x = float(item.get("x", 72))
-            y = float(item.get("y", 72))
-            w = float(item.get("w", 180))
-            h = float(item.get("h", 40))
-            if item.get("type") == "text":
-                text = str(item.get("text", "")).strip()
-                if not text:
-                    continue
-                size = max(6, float(item.get("size", 14)))
-                color = hex_to_rgb(item.get("color", "#000000"))
-                rect = fitz.Rect(x, y, x + w, y + h)
-                page.insert_textbox(rect, text, fontsize=size, color=color, align=0, overlay=True)
-            elif item.get("type") == "signature":
-                data = str(item.get("data", ""))
-                if not data.startswith("data:image/png;base64,"):
-                    continue
-                img_bytes = base64.b64decode(data.split(",", 1)[1])
-                rect = fitz.Rect(x, y, x + w, y + h)
-                page.insert_image(rect, stream=img_bytes, overlay=True, keep_proportion=True)
-        out = output_path("dynamic_edited")
-        doc.save(out, garbage=4, deflate=True)
-        doc.close()
-        return send_file(out, as_attachment=True, download_name="edited_dynamic.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
-
-
-@app.route("/api/compress", methods=["POST"])
-def compress():
-    try:
-        pdf = save_upload(request.files.get("pdf"))
-        doc = fitz.open(pdf)
-        out = output_path("compressed")
-        doc.save(out, garbage=4, deflate=True, clean=True)
-        doc.close()
-        return send_file(out, as_attachment=True, download_name="compressed.pdf")
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
-
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+        if st.button("Save edited PDF", type="primary"):
+            edited = apply_overlays(st.session_state.pdf_bytes, st.session_state.page_overlays, zoom=zoom)
+            st.download_button("Download edited PDF", edited, "edited_pdf.pdf", "application/pdf")

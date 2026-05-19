@@ -1,33 +1,35 @@
-# Pro PDF Studio - Dynamic Editor
+# Streamlit PDF Editor
 
-Local Flask PDF editor with Adobe-style dark UI.
+Adobe-style PDF editor starter built with Streamlit.
 
-## Run
+## Features
+- Upload PDF
+- Page preview
+- Add text overlays
+- Draw transparent signature
+- Drag/move/resize overlays dynamically
+- Delete last overlay / clear page overlays
+- Save edited PDF
+- Merge PDFs
+- Split PDF page ranges
+- Rotate pages
+- Compress/clean PDF
 
+## Run locally
 ```bash
 python -m pip install -r requirements.txt
-python app.py
+streamlit run app.py
 ```
 
-Open: http://127.0.0.1:5000
+## Deploy to Streamlit Cloud
+1. Create a GitHub repo.
+2. Upload `app.py`, `requirements.txt`, and this README.
+3. Go to Streamlit Cloud.
+4. Create a new app from the repo.
+5. Main file path: `app.py`.
+6. Deploy.
 
-## Dynamic editing
-
-1. Upload a PDF.
-2. Choose Dynamic Text or Dynamic Signature.
-3. Click the PDF page to place it.
-4. Drag to move. Use the blue handle to resize. Double-click text to edit it.
-5. Press Delete/Backspace to remove the selected item.
-6. Click Save Edited PDF.
-
-## Tools
-
-- Dynamic text placement
-- Draw or typed signature placement
-- Drag/resize edits on the PDF preview
-- Rotate pages
-- Extract/delete pages
-- Reorder pages
-- Merge PDFs
-- Watermark
-- Compress
+## Notes
+- Use **Transform / Move / Resize** mode to click overlays and drag/resize them.
+- Signatures are stored as transparent PNG overlays.
+- Export creates a new edited PDF; it does not overwrite the original file.
