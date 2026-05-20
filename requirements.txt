@@ -2,3 +2,4 @@ streamlit==1.45.1
 pymupdf==1.24.9
 pypdf==5.5.0
 Pillow==10.4.0
+streamlit-drawable-canvas==0.9.3
