@@ -1,35 +1,31 @@
-# Streamlit PDF Editor
+# Flask PDF Editor
 
-Adobe-style PDF editor starter built with Streamlit.
+Adobe-style PDF editor built with Flask + PDF.js.
 
-## Features
-- Upload PDF
-- Page preview
-- Add text overlays
-- Draw transparent signature
-- Drag/move/resize overlays dynamically
-- Delete last overlay / clear page overlays
-- Save edited PDF
-- Merge PDFs
-- Split PDF page ranges
-- Rotate pages
-- Compress/clean PDF
+## Local run
 
-## Run locally
 ```bash
 python -m pip install -r requirements.txt
-streamlit run app.py
+python app.py
 ```
 
-## Deploy to Streamlit Cloud
-1. Create a GitHub repo.
-2. Upload `app.py`, `requirements.txt`, and this README.
-3. Go to Streamlit Cloud.
-4. Create a new app from the repo.
-5. Main file path: `app.py`.
-6. Deploy.
+Open http://127.0.0.1:5000
 
-## Notes
-- Use **Transform / Move / Resize** mode to click overlays and drag/resize them.
-- Signatures are stored as transparent PNG overlays.
-- Export creates a new edited PDF; it does not overwrite the original file.
+## Render deploy
+
+Build command:
+```bash
+pip install -r requirements.txt
+```
+
+Start command:
+```bash
+gunicorn app:app --bind 0.0.0.0:$PORT
+```
+
+Required files:
+- app.py
+- requirements.txt
+- runtime.txt
+- Procfile
+- templates/index.html
